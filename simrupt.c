@@ -10,6 +10,8 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
+#include "game.h"
+
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("A device that simulates interrupts");
@@ -25,10 +27,13 @@ MODULE_DESCRIPTION("A device that simulates interrupts");
 
 #define NR_SIMRUPT 1
 
+#define N_GRIDSbuf ((BOARD_SIZE * 2 + 2) * (BOARD_SIZE + 2))
+
 static int delay = 100; /* time (in ms) to generate an event */
 
 /* Data produced by the simulated device */
-static int simrupt_data;
+static int simrupt_data = -1;
+static int chess = 0;
 
 /* Timer to simulate a periodic IRQ */
 static struct timer_list timer;
@@ -37,6 +42,10 @@ static struct timer_list timer;
 static int major;
 static struct class *simrupt_class;
 static struct cdev simrupt_cdev;
+
+/* Game board */
+char table[N_GRIDS];
+char table_buff[N_GRIDSbuf];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -53,19 +62,69 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Generate new data from the simulated device */
 static inline int update_simrupt_data(void)
 {
-    simrupt_data = max((simrupt_data + 1) % 0x7f, 0x20);
+    simrupt_data = max((simrupt_data + 1) % 16, 0);
     return simrupt_data;
 }
 
+
+static int init_board(void)
+{
+    int i = 0;
+    for (int x = 0; x < 9; x++) {
+        table_buff[i++] = '-';
+        smp_wmb();
+    }
+
+    table_buff[i++] = '\n';
+    smp_wmb();
+
+    for (int x = 0; x < BOARD_SIZE; x++) {
+        for (int y = 0; y < BOARD_SIZE; y++) {
+            table_buff[i++] = '|';
+            smp_wmb();
+            table_buff[i++] = ' ';
+            smp_wmb();
+        }
+        table_buff[i++] = '|';
+        smp_wmb();
+        table_buff[i++] = '\n';
+        smp_wmb();
+    }
+
+    for (int x = 0; x < 9; x++) {
+        table_buff[i++] = '-';
+        smp_wmb();
+    }
+
+    table_buff[i++] = '\n';
+    smp_wmb();
+
+    return 0;
+}
+
+static void update_board(int val, const char *table)
+{
+    int row = val / BOARD_SIZE;
+    int col = val % BOARD_SIZE;
+    int index = 10 + 10 * row + (2 * (col + 1) - 1);
+    table_buff[index] = table[val];
+}
+
 /* Insert a value into the kfifo buffer */
-static void produce_data(unsigned char val)
+static void produce_data(int val)
 {
     /* Implement a kind of circular FIFO here (skip oldest element if kfifo
      * buffer is full).
      */
-    unsigned int len = kfifo_in(&rx_fifo, &val, sizeof(val));
-    if (unlikely(len < sizeof(val)) && printk_ratelimit())
-        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(val) - len);
+    if (chess % 2)
+        table[val] = 'O';
+    else
+        table[val] = 'X';
+    chess += 1;
+    update_board(val, table);
+    unsigned int len = kfifo_in(&rx_fifo, table_buff, sizeof(table_buff));
+    if (unlikely(len < sizeof(table_buff)) && printk_ratelimit())
+        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(table_buff) - len);
 
     pr_debug("simrupt: %s: in %u/%u bytes\n", __func__, len,
              kfifo_len(&rx_fifo));
@@ -82,6 +141,7 @@ static DEFINE_MUTEX(consumer_lock);
 /* We use an additional "faster" circular buffer to quickly store data from
  * interrupt context, before adding them to the kfifo.
  */
+
 static struct circ_buf fast_buf;
 
 static int fast_buf_get(void)
@@ -110,7 +170,7 @@ static int fast_buf_get(void)
     return ret;
 }
 
-static int fast_buf_put(unsigned char val)
+static int fast_buf_put(int val)
 {
     struct circ_buf *ring = &fast_buf;
     unsigned long head = ring->head;
@@ -321,6 +381,7 @@ static int __init simrupt_init(void)
     dev_t dev_id;
     int ret;
 
+    init_board();
     if (kfifo_alloc(&rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
         return -ENOMEM;
 
